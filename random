@@ -1,0 +1,265 @@
+#include <assert.h>
+#include <stdlib.h>
+#include <ucontext.h>
+#include <stdio.h>
+#include "thread.h"
+
+/* This is the wait queue structure, needed for Assignment 2. */
+struct wait_queue {
+        /* ... Fill this in Assignment 2 ... */
+};
+
+/* For Assignment 1, you will need a queue structure to keep track of the
+ * runnable threads. You can use the tutorial 1 queue implementation if you
+ * like. You will probably find in Assignment 2 that the operations needed
+ * for the wait_queue are the same as those needed for the ready_queue.
+ */
+
+/* This is the thread control block. */
+typedef struct thread {
+        /* ... Fill this in ... */
+        Tid tid;
+        ucontext_t context;
+        int state;
+        int setcontext_called;
+        void *stack_ptr;
+} thread;
+
+static thread *running_thread = NULL;
+static thread *ready_queue[THREAD_MAX_THREADS];
+static thread *threads[THREAD_MAX_THREADS];
+static int num_threads = 0;
+
+unsigned long rq_head_idx = 0;
+unsigned long rq_tail_idx = 0;
+unsigned long rq_nitems = 0;
+
+static void compact_queue(int idx) {
+        int cur = idx;
+        while (cur != rq_tail_idx) {
+                int next = (cur + 1) % THREAD_MAX_THREADS;
+                ready_queue[cur] = ready_queue[next];
+                cur = next;
+        }
+        if (rq_tail_idx == 0) {
+                rq_tail_idx = THREAD_MAX_THREADS - 1;
+        } else {
+                rq_tail_idx = cur - 1;
+        }
+}
+
+void enqueue(thread *t) {
+        if (rq_nitems >= THREAD_MAX_THREADS) {
+                return;
+        }
+        ready_queue[rq_tail_idx] = t;
+        rq_tail_idx = (rq_tail_idx + 1) % THREAD_MAX_THREADS;
+        rq_nitems++;
+}
+
+thread *dequeue() {
+        if (rq_nitems == 0) {
+                return NULL;
+        }
+        thread *temp = ready_queue[rq_head_idx];
+        rq_head_idx = (rq_head_idx + 1) % THREAD_MAX_THREADS;
+        rq_nitems--;
+        return temp;
+}
+
+thread *dequeue_by_tid(Tid tid) {
+        if (rq_nitems == 0) {
+                return NULL;
+        }
+        for (int i = 0; i < rq_nitems; i++) {
+                int idx = (rq_head_idx + i) % THREAD_MAX_THREADS;
+                if (ready_queue[idx]->tid == tid) {
+                        thread *temp = ready_queue[idx];
+                        compact_queue(idx);
+                        rq_nitems--;
+                        return temp;
+                }
+        }
+        return NULL;
+}
+
+void print_queue() {
+        for (int i = 0; i < rq_nitems; i++) {
+                int idx = (rq_head_idx + i) % THREAD_MAX_THREADS;
+                printf("%d -> ", ready_queue[idx]->tid);
+        }
+        printf("\n");
+}
+
+enum {
+        READY = 1,
+        RUNNING = 2
+};
+
+/**************************************************************************
+ * Assignment 1: Refer to thread.h for the detailed descriptions of the six
+ *               functions you need to implement.
+ **************************************************************************/
+
+void
+thread_init(void)
+{
+        /* Add necessary initialization for your threads library here. */
+        /* Initialize the thread control block for the first thread */
+        thread *kernel = (thread*)malloc(sizeof(thread));
+        kernel->tid = 0;
+        kernel->setcontext_called = 0;
+        kernel->state = RUNNING;
+        kernel->stack_ptr = NULL;
+        getcontext(&kernel->context);
+
+        for (int i = 0; i < THREAD_MAX_THREADS; i++) {
+                threads[i] = NULL;
+        }
+        threads[0] = kernel;
+        num_threads++;
+        running_thread = kernel;
+}
+
+Tid
+thread_id()
+{
+        if (running_thread != NULL) {
+                return running_thread->tid;
+        }
+        return THREAD_INVALID;
+}
+
+/* New thread starts by calling thread_stub. The arguments to thread_stub are
+ * the thread_main() function, and one argument to the thread_main() function.
+ */
+void
+thread_stub(void (*thread_main)(void *), void *arg)
+{
+        thread_main(arg); // call thread_main() function with arg
+        thread_exit(0);
+}
+
+Tid
+thread_create(void (*fn) (void *), void *parg)
+{
+        if (num_threads >= THREAD_MAX_THREADS) {
+                return THREAD_NOMORE;
+        }
+
+        int new_tid = 0;
+        while (threads[new_tid] != NULL) {
+                new_tid++;
+        }
+
+        thread *temp = (thread*)malloc(sizeof(thread));
+        temp->tid = new_tid;
+        threads[new_tid] = temp;
+        temp->state = READY;
+        temp->setcontext_called = 0;
+        getcontext(&temp->context);
+        enqueue(temp);
+        num_threads++;
+
+        void *stack = malloc(THREAD_MIN_STACK);
+        temp->context.uc_mcontext.gregs[REG_RIP] = (long long int)&thread_stub;
+        temp->context.uc_mcontext.gregs[REG_RDI] = (long long int)fn;
+        temp->context.uc_mcontext.gregs[REG_RSI] = (long long int)parg;
+        temp->context.uc_mcontext.gregs[REG_RSP] = (long long int)stack + THREAD_MIN_STACK - 8;
+        temp->context.uc_stack.ss_sp = stack;
+        temp->stack_ptr = stack;
+        temp->context.uc_stack.ss_size = THREAD_MIN_STACK - 8;
+
+        return temp->tid;
+}
+
+Tid
+thread_yield(Tid want_tid)
+{
+        if (want_tid == thread_id() || want_tid == THREAD_SELF) {
+                return thread_id();
+        } else if (want_tid == THREAD_ANY) {
+                Tid ret = running_thread->tid;
+
+                if (rq_nitems == 0) {
+                        return THREAD_NONE;
+                }
+
+                running_thread->state = READY;
+                enqueue(running_thread);
+                getcontext(&running_thread->context);
+
+                if (running_thread->setcontext_called == 0) {
+                        running_thread->setcontext_called = 1;
+                        thread *temp = dequeue();
+
+                        ret = temp->tid;
+                        running_thread = temp;
+                        running_thread->state = RUNNING;
+                        setcontext(&running_thread->context);
+                }
+                running_thread->setcontext_called = 0;
+
+                return ret;
+
+        } else if (want_tid < 0 || want_tid >= THREAD_MAX_THREADS || threads[want_tid] == NULL) {
+                return THREAD_INVALID;
+        }
+
+        Tid ret = want_tid;
+
+        thread *next_thread = dequeue_by_tid(want_tid);
+        if (next_thread == NULL) {
+                return THREAD_INVALID;
+        }
+
+        running_thread->state = READY;
+        enqueue(running_thread);
+        getcontext(&running_thread->context);
+
+        if (running_thread->setcontext_called == 0) {
+                running_thread->setcontext_called = 1;
+                running_thread = next_thread;
+
+                running_thread->state = RUNNING;
+                setcontext(&next_thread->context);
+                ret = running_thread->tid;
+        }
+        running_thread->setcontext_called = 0;
+
+        return ret;
+}
+
+void
+thread_exit(int exit_code)
+{
+        if (rq_nitems == 0) {
+                exit(0);
+        }
+        threads[running_thread->tid] = NULL;
+        free(running_thread->stack_ptr);
+        free(running_thread);
+        num_threads--;
+        running_thread = dequeue();
+        if (running_thread == NULL) {
+                exit(0);
+        }
+        setcontext(&running_thread->context);
+}
+
+Tid
+thread_kill(Tid tid)
+{
+        if (tid < 0 || tid > THREAD_MAX_THREADS || running_thread->tid == tid || threads[tid] == NULL) {
+                return THREAD_INVALID;
+        }
+        thread *killed_thread = dequeue_by_tid(tid);
+        if (killed_thread == NULL) {
+                return THREAD_INVALID;
+        }
+        threads[killed_thread->tid] = NULL;
+        free(killed_thread->stack_ptr);
+        free(killed_thread);
+        num_threads--;
+        return tid;
+}
